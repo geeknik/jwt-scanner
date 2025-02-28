@@ -383,10 +383,15 @@ class JWTConfusionScanner:
         
         return results
     
-    def test_algorithm_substitution(self, header: Dict, payload: Dict) -> List[bool]:
+    def test_algorithm_substitution(self, header: Dict, payload: Dict, orig_token: str) -> List[bool]:
         """
         Test for simple algorithm substitution
         
+        Args:
+            header: Original JWT header
+            payload: Original JWT payload
+            orig_token: Original JWT token string
+            
         Returns:
             List of booleans indicating success for each variant tried
         """
@@ -630,7 +635,7 @@ class JWTConfusionScanner:
             
             results['alg_none'] = self.test_alg_none(header, payload)
             results['key_confusion'] = self.test_key_confusion(header, payload, orig_token)
-            results['algorithm_substitution'] = self.test_algorithm_substitution(header, payload) 
+            results['algorithm_substitution'] = self.test_algorithm_substitution(header, payload, orig_token) 
             results['kid_manipulation'] = self.test_kid_manipulation(header, payload, orig_token)
             results['jku_manipulation'] = self.test_jku_manipulation(header, payload, orig_token)
             results['payload_manipulation'] = self.test_payload_manipulation(header, payload)
@@ -701,6 +706,7 @@ def main():
     )
     
     scanner.scan()
+
 
 if __name__ == "__main__":
     main()
