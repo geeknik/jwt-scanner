@@ -283,23 +283,34 @@ class JWTConfusionScanner:
             result["details"]["valid_similarity"] = valid_similarity
             result["details"]["invalid_similarity"] = invalid_similarity
             
+            print(f"{Fore.BLUE}[*] Response similarity - Valid: {valid_similarity:.2f}, Invalid: {invalid_similarity:.2f}{Style.RESET_ALL}")
+            
             # If response is clearly more similar to valid baseline
             if valid_similarity > invalid_similarity + 0.3:  # 30% threshold
                 initial_confidence += 40  # Strong indicator
                 result["details"]["baseline_comparison"] = "More similar to valid response"
+                print(f"{Fore.GREEN}[+] Response is significantly more similar to valid token response{Style.RESET_ALL}")
             elif valid_similarity > invalid_similarity + 0.1:  # 10% threshold
                 initial_confidence += 20  # Moderate indicator
                 result["details"]["baseline_comparison"] = "Somewhat similar to valid response"
+                print(f"{Fore.YELLOW}[+] Response is somewhat similar to valid token response{Style.RESET_ALL}")
+            else:
+                print(f"{Fore.RED}[-] Response is not similar to valid token response{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.YELLOW}[!] No baseline responses available for comparison{Style.RESET_ALL}")
         
         # Check status code 
         result["details"]["status_code"] = response.status_code
         if response.status_code < 400:
             initial_confidence += 20
-            self._print_verbose(f"{Fore.YELLOW}[*] Got non-error status code: {response.status_code}{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}[*] Got non-error status code: {response.status_code}{Style.RESET_ALL}")
         elif response.status_code >= 500:
             # Server errors might indicate successful exploitation in some cases
             initial_confidence += 5
             result["details"]["server_error"] = True
+            print(f"{Fore.YELLOW}[*] Server error response: {response.status_code}{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.RED}[-] Error status code: {response.status_code}{Style.RESET_ALL}")
         
         # Check for success indicators in response text
         success_indicators_found = []
@@ -321,7 +332,7 @@ class JWTConfusionScanner:
         
         if failure_indicators_found:
             result["details"]["failure_indicators_found"] = failure_indicators_found
-            self._print_verbose(f"{Fore.RED}[*] Failure indicators found: {', '.join(failure_indicators_found)}{Style.RESET_ALL}")
+            print(f"{Fore.RED}[-] Failure indicators found: {', '.join(failure_indicators_found)}{Style.RESET_ALL}")
         
         # Check for sensitive data in response that might indicate successful attack
         sensitive_data_found = []
@@ -341,6 +352,30 @@ class JWTConfusionScanner:
             result["details"]["sensitive_data_found"] = sensitive_data_found
             print(f"{Fore.GREEN}[+] Sensitive data found: {', '.join(sensitive_data_found)}{Style.RESET_ALL}")
         
+        # Compare content length with baselines
+        if self.baseline_valid_response and self.baseline_invalid_response:
+            valid_len = len(self.baseline_valid_response.content)
+            invalid_len = len(self.baseline_invalid_response.content)
+            current_len = len(response.content)
+            
+            # Calculate how close the response is to valid vs invalid length
+            valid_len_diff = abs(current_len - valid_len)
+            invalid_len_diff = abs(current_len - invalid_len)
+            
+            print(f"{Fore.BLUE}[*] Content length - Current: {current_len}, Valid: {valid_len}, Invalid: {invalid_len}{Style.RESET_ALL}")
+            
+            # If response length is closer to valid than invalid
+            if valid_len_diff < invalid_len_diff:
+                # If they're significantly different
+                if invalid_len_diff > 2 * valid_len_diff:
+                    initial_confidence += 15
+                    print(f"{Fore.GREEN}[+] Response length is much closer to valid response{Style.RESET_ALL}")
+                else:
+                    initial_confidence += 5
+                    print(f"{Fore.YELLOW}[+] Response length is somewhat closer to valid response{Style.RESET_ALL}")
+            else:
+                print(f"{Fore.RED}[-] Response length is closer to invalid response{Style.RESET_ALL}")
+        
         # Finalize confidence score (cap between 0-100)
         confidence = max(0, min(100, initial_confidence))
         result["confidence"] = confidence
@@ -358,7 +393,13 @@ class JWTConfusionScanner:
             
         # Report confidence level
         confidence_label = "HIGH" if confidence >= 70 else "MEDIUM" if confidence >= 40 else "LOW"
-        print(f"{Fore.BLUE}[*] Confidence: {confidence}% ({confidence_label}){Style.RESET_ALL}")
+        print(f"{Fore.BLUE}[*] Final confidence: {confidence}% ({confidence_label}){Style.RESET_ALL}")
+        
+        # Final assessment
+        if result["success"]:
+            print(f"{Fore.GREEN}[+] Assessment: Potentially vulnerable to this attack vector{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.RED}[-] Assessment: Not vulnerable to this attack vector{Style.RESET_ALL}")
         
         return result
     
@@ -429,25 +470,31 @@ class JWTConfusionScanner:
         Returns:
             Dictionary with detailed attack results
         """
-        print(f"{Fore.BLUE}[*] Trying {attack_type}: {description}{Style.RESET_ALL}")
-        self._print_verbose(f"    Token: {token}")
+        print(f"\n{Fore.BLUE}[*] Trying {attack_type}: {description}{Style.RESET_ALL}")
+        print(f"{Fore.BLUE}[*] Modified token: {token[:20]}...{token[-20:]}{Style.RESET_ALL}")
         
         # First test against main endpoint
         response = self._make_request(token)
         if not response:
+            print(f"{Fore.RED}[-] No response received{Style.RESET_ALL}")
             return {"success": False, "confidence": 0, "verified": False, "reason": "No response received"}
-            
-        self._print_verbose(f"    Status code: {response.status_code}")
+        
+        print(f"{Fore.BLUE}[*] Response status code: {response.status_code}{Style.RESET_ALL}")
         
         # Evaluate initial response
+        print(f"{Fore.BLUE}[*] Evaluating response...{Style.RESET_ALL}")
         initial_result = self._evaluate_response(response, attack_type)
         
         # If not successful, return immediately
         if not initial_result["success"]:
+            print(f"{Fore.RED}[-] Attack unsuccessful: {initial_result['reason']}{Style.RESET_ALL}")
             return {
                 "success": False, 
                 "confidence": initial_result["confidence"],
                 "verified": False,
+                "attack_type": attack_type,
+                "token": token,
+                "description": description,
                 "reason": initial_result["reason"]
             }
             
@@ -483,6 +530,7 @@ class JWTConfusionScanner:
             verification_confidence = initial_result["confidence"]
             if verification_confidence >= 70:  # Only auto-verify if confidence is very high
                 verified = True
+                print(f"{Fore.GREEN}[+] Auto-verified due to high confidence score.{Style.RESET_ALL}")
         
         # Determine final result
         final_result = {
@@ -501,10 +549,10 @@ class JWTConfusionScanner:
         
         # Report findings
         if verified:
-            print(f"{Fore.GREEN}[+] VERIFIED vulnerability found! Attack: {attack_type}{Style.RESET_ALL}")
+            print(f"{Fore.GREEN}[+] VERIFIED VULNERABILITY FOUND! Attack: {attack_type}{Style.RESET_ALL}")
             print(f"{Fore.GREEN}[+] Vulnerable token: {token}{Style.RESET_ALL}")
         elif initial_result["success"]:
-            print(f"{Fore.YELLOW}[+] POTENTIAL vulnerability found! Attack: {attack_type}{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}[+] POTENTIAL VULNERABILITY FOUND! Attack: {attack_type}{Style.RESET_ALL}")
             print(f"{Fore.YELLOW}[+] Potentially vulnerable token: {token}{Style.RESET_ALL}")
             print(f"{Fore.YELLOW}[!] Manual verification recommended{Style.RESET_ALL}")
             
@@ -564,12 +612,12 @@ class JWTConfusionScanner:
         except:
             return False
     
-    def test_alg_none(self, header: Dict, payload: Dict) -> List[bool]:
+    def test_alg_none(self, header: Dict, payload: Dict) -> List[Dict]:
         """
         Test for 'none' algorithm vulnerability
         
         Returns:
-            List of booleans indicating success for each variant tried
+            List of dictionaries with detailed results of each attack attempt
         """
         print(f"\n{Fore.CYAN}[*] Testing for 'none' algorithm vulnerability...{Style.RESET_ALL}")
         results = []
@@ -593,12 +641,12 @@ class JWTConfusionScanner:
         
         return results
         
-    def test_key_confusion(self, header: Dict, payload: Dict, orig_token: str) -> List[bool]:
+    def test_key_confusion(self, header: Dict, payload: Dict, orig_token: str) -> List[Dict]:
         """
         Test for algorithm confusion with key confusion attacks
         
         Returns:
-            List of booleans indicating success for each variant tried
+            List of dictionaries with detailed results of each attack attempt
         """
         print(f"\n{Fore.CYAN}[*] Testing for key confusion vulnerability...{Style.RESET_ALL}")
         results = []
@@ -642,7 +690,7 @@ class JWTConfusionScanner:
         
         return results
     
-    def test_algorithm_substitution(self, header: Dict, payload: Dict, orig_token: str) -> List[bool]:
+    def test_algorithm_substitution(self, header: Dict, payload: Dict, orig_token: str) -> List[Dict]:
         """
         Test for simple algorithm substitution
         
@@ -652,7 +700,7 @@ class JWTConfusionScanner:
             orig_token: Original JWT token string
             
         Returns:
-            List of booleans indicating success for each variant tried
+            List of dictionaries with detailed results of each attack attempt
         """
         print(f"\n{Fore.CYAN}[*] Testing for algorithm substitution...{Style.RESET_ALL}")
         results = []
@@ -682,12 +730,12 @@ class JWTConfusionScanner:
         
         return results
     
-    def test_kid_manipulation(self, header: Dict, payload: Dict, orig_token: str) -> List[bool]:
+    def test_kid_manipulation(self, header: Dict, payload: Dict, orig_token: str) -> List[Dict]:
         """
         Test for kid (Key ID) header parameter manipulation
         
         Returns:
-            List of booleans indicating success for each variant tried
+            List of dictionaries with detailed results of each attack attempt
         """
         print(f"\n{Fore.CYAN}[*] Testing for 'kid' header manipulation...{Style.RESET_ALL}")
         results = []
@@ -742,12 +790,12 @@ class JWTConfusionScanner:
         
         return results
     
-    def test_jku_manipulation(self, header: Dict, payload: Dict, orig_token: str) -> List[bool]:
+    def test_jku_manipulation(self, header: Dict, payload: Dict, orig_token: str) -> List[Dict]:
         """
         Test for jku (JWK Set URL) header parameter manipulation
         
         Returns:
-            List of booleans indicating success for each variant tried
+            List of dictionaries with detailed results of each attack attempt
         """
         print(f"\n{Fore.CYAN}[*] Testing for 'jku' header manipulation...{Style.RESET_ALL}")
         results = []
@@ -778,12 +826,12 @@ class JWTConfusionScanner:
         
         return results
     
-    def test_payload_manipulation(self, header: Dict, payload: Dict) -> List[bool]:
+    def test_payload_manipulation(self, header: Dict, payload: Dict) -> List[Dict]:
         """
         Test for basic payload manipulation with algorithm confusion
         
         Returns:
-            List of booleans indicating success for each variant tried
+            List of dictionaries with detailed results of each attack attempt
         """
         print(f"\n{Fore.CYAN}[*] Testing for payload manipulation with algorithm confusion...{Style.RESET_ALL}")
         results = []
@@ -836,12 +884,12 @@ class JWTConfusionScanner:
         
         return results
     
-    def test_custom_payloads(self, header: Dict, payload: Dict) -> List[bool]:
+    def test_custom_payloads(self, header: Dict, payload: Dict) -> List[Dict]:
         """
         Test with user-provided custom payloads
         
         Returns:
-            List of booleans indicating success for each variant tried
+            List of dictionaries with detailed results of each attack attempt
         """
         if not self.custom_payloads:
             return []
