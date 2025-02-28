@@ -55,6 +55,7 @@ python jwt_scanner.py https://target.com -t "eyJhbG..." --verify-endpoint "https
 ```
 
 This tells the scanner to:
+
 1. Test the main URL for initial vulnerabilities
 2. Verify successful exploitation by testing the vulnerable token against the `/admin/dashboard` endpoint
 3. Look for specific strings that indicate success or failure
@@ -161,7 +162,7 @@ optional arguments:
 2. **Multiple attack vectors** - Tests common JWT flaws in a single run
 3. **Smart response analysis** - Uses baseline comparisons and confidence scoring to reduce false positives
 4. **Public key exploitation** - Tests for signature bypasses using public key confusion
-5. **Custom payload support** - Test with your own JWT manipulation techniques 
+5. **Custom payload support** - Test with your own JWT manipulation techniques
 6. **Verification capabilities** - Confirms vulnerabilities using secondary endpoints and detailed response analysis
 7. **Confidence scoring** - Provides a confidence score for each potential vulnerability based on multiple indicators
 8. **Proof of Concept generation** - Automatically creates ready-to-use exploit scripts for verified vulnerabilities
