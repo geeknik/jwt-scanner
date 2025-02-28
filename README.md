@@ -51,7 +51,7 @@ python jwt_scanner.py https://target.com -t "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ
 To reduce false positives, use the verification options:
 
 ```bash
-python jwt_confusion_scanner.py https://target.com -t "eyJhbG..." --verify-endpoint "https://target.com/admin/dashboard" --success-strings "Welcome,admin panel" --failure-strings "unauthorized,login required"
+python jwt_scanner.py https://target.com -t "eyJhbG..." --verify-endpoint "https://target.com/admin/dashboard" --success-strings "Welcome,admin panel" --failure-strings "unauthorized,login required"
 ```
 
 This tells the scanner to:
@@ -132,7 +132,7 @@ Example output:
 ### Options
 
 ```
-usage: jwt_confusion_scanner.py [-h] [-t TOKEN] [-c COOKIE] [-a] [-k PUBLIC_KEY] [-p PAYLOAD] [-v] [-d DELAY] [--verify-endpoint ENDPOINT] [--success-strings STRINGS] [--failure-strings STRINGS] [--output FILE] [--verify-all] url
+usage: jwt_scanner.py [-h] [-t TOKEN] [-c COOKIE] [-a] [-k PUBLIC_KEY] [-p PAYLOAD] [-v] [-d DELAY] [--verify-endpoint ENDPOINT] [--success-strings STRINGS] [--failure-strings STRINGS] [--output FILE] [--verify-all] url
 
 JWT Algorithm Confusion Scanner
 
@@ -192,6 +192,46 @@ Tests if the JWK Set URL (`jku`) parameter can be manipulated to point to an att
 
 Tests if various privilege escalation payload modifications can be successful when combined with other attacks.
 
+## Understanding Results and Avoiding False Positives
+
+The scanner uses a sophisticated system to determine if a target is vulnerable to JWT attacks. However, it's important to understand how to interpret the results:
+
+### Confidence Scores
+
+Results include a confidence score (0-100%) that indicates how likely a vulnerability is real:
+
+- **HIGH (70-100%)**: Strong evidence of vulnerability, especially if authentication verification is also high
+- **MEDIUM (50-69%)**: Potential vulnerability that requires manual verification
+- **LOW (0-49%)**: Likely not vulnerable or insufficient evidence
+
+### Authentication Verification
+
+The scanner now includes authentication verification that tests if JWT tokens actually affect access to resources:
+
+- **High auth confidence (>0.5)**: Token appears to control access to protected resources
+- **Low auth confidence (<0.1)**: Site may be ignoring JWT tokens entirely
+
+### Warning Signs of False Positives
+
+Be cautious of potential false positives when you see these warnings:
+
+1. "Valid and invalid baseline responses are very similar" - Site may be ignoring tokens entirely
+2. "Response very similar to previous attacks" - Different attack types shouldn't produce identical responses
+3. "Token does not appear to affect access to resources" - Real JWT authentication should show differences
+
+### Contextual Success Indicators
+
+The scanner now uses contextual analysis for success indicators, only counting words like "success" or "profile" when they appear in authentication-related contexts, not just anywhere on the page.
+
+### Verifying Results
+
+For the most accurate results:
+
+1. Always use the `--verify-endpoint` option with a protected resource
+2. Provide custom `--success-strings` and `--failure-strings` specific to your target
+3. Manually verify any "POTENTIAL VULNERABILITY" findings
+4. Check the evidence in POC reports for clear differences between original and attack responses
+
 ## Example Output
 
 ```
@@ -209,8 +249,13 @@ Tests if various privilege escalation payload modifications can be successful wh
 
 [*] Testing for 'none' algorithm vulnerability...
 [*] Trying alg-none: Algorithm set to 'none' with empty signature
-[*] Confidence: 75% (HIGH)
-[+] Success indicators found: 'admin'
+[*] Verifying if token affects authentication...
+[*] Authentication verification confidence: 0.83
+[+] Token appears to affect access to resources
+[*] Evaluating response...
+[*] Response similarity - Valid: 0.85, Invalid: 0.25
+[+] Response is significantly more similar to valid token response
+[*] Adjusted confidence: 75% (auth factor: 1.00)
 [*] Verifying with secondary endpoint: https://vulnerable-site.com/admin/dashboard
 [*] Confidence: 92% (HIGH)
 [+] VERIFIED vulnerability found! Attack: alg-none
@@ -218,7 +263,13 @@ Tests if various privilege escalation payload modifications can be successful wh
 
 [*] Testing for key confusion vulnerability...
 [*] Trying key-confusion: Switched from RS256 to HS256 using public key as HMAC secret
-[*] Confidence: 45% (MEDIUM)
+[*] Verifying if token affects authentication...
+[*] Authentication verification confidence: 0.67
+[+] Token appears to affect access to resources
+[*] Evaluating response...
+[*] Response similarity - Valid: 0.65, Invalid: 0.40
+[+] Response is somewhat similar to valid token response
+[*] Adjusted confidence: 45% (auth factor: 1.00)
 [+] POTENTIAL vulnerability found! Attack: key-confusion
 [+] Potentially vulnerable token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.a77Bn8Vxe7YRzOZ9Ao0j4J4pRwIwNql7Z5x98QPXIoc
 [!] Manual verification recommended
@@ -265,13 +316,16 @@ This tool is designed for security professionals with proper authorization to te
 
 ## Reducing False Positives
 
-The scanner uses several techniques to minimize false positives:
+The scanner uses several advanced techniques to minimize false positives:
 
-1. **Baseline Comparison**: Establishes how the application responds to valid and invalid tokens for comparison
-2. **Confidence Scoring**: Calculates a confidence percentage based on multiple indicators
-3. **Secondary Verification**: Tests verified tokens against additional endpoints to confirm exploitation
-4. **Response Analysis**: Examines response content, headers, and status codes for both positive and negative indicators
-5. **Custom Success/Failure Indicators**: Allows specifying application-specific strings that indicate successful/failed exploitation
+1. **Baseline Comparison**: Establishes how the application responds to valid and invalid tokens for comparison, with detection of sites that ignore tokens entirely
+2. **Authentication Verification**: Tests if tokens actually affect access to protected resources by comparing responses with and without tokens
+3. **Contextual Success Indicators**: Only counts success indicators when they appear in authentication-related contexts, not just anywhere on the page
+4. **Cross-Attack Response Comparison**: Detects when different attack types produce very similar responses, suggesting the site ignores tokens
+5. **Confidence Scoring**: Calculates a confidence percentage based on multiple indicators, with adjustments based on authentication verification
+6. **Secondary Verification**: Tests verified tokens against additional endpoints to confirm exploitation
+7. **Response Analysis**: Examines response content, headers, and status codes for both positive and negative indicators
+8. **Custom Success/Failure Indicators**: Allows specifying application-specific strings that indicate successful/failed exploitation
 
 ## License
 
