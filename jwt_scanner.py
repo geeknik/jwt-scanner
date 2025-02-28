@@ -277,6 +277,16 @@ class JWTConfusionScanner:
         
         # Compare with baselines if available
         if self.baseline_valid_response and self.baseline_invalid_response:
+            # Check if valid and invalid baselines are too similar to each other
+            # This would indicate the site is likely ignoring JWT tokens entirely
+            baseline_similarity = self._calculate_similarity(self.baseline_valid_response, self.baseline_invalid_response)
+            
+            if baseline_similarity > 0.8:
+                print(f"{Fore.YELLOW}[!] Warning: Valid and invalid baseline responses are very similar ({baseline_similarity:.2f}){Style.RESET_ALL}")
+                print(f"{Fore.YELLOW}[!] This suggests the site may be ignoring JWT tokens entirely{Style.RESET_ALL}")
+                initial_confidence -= 50  # Significantly reduce confidence
+                result["details"]["baseline_warning"] = f"Valid and invalid baselines are {baseline_similarity:.2f} similar"
+            
             # Check if response is more similar to valid than invalid baseline
             valid_similarity = self._calculate_similarity(response, self.baseline_valid_response)
             invalid_similarity = self._calculate_similarity(response, self.baseline_invalid_response)
@@ -297,6 +307,7 @@ class JWTConfusionScanner:
                 print(f"{Fore.YELLOW}[+] Response is somewhat similar to valid token response{Style.RESET_ALL}")
             else:
                 print(f"{Fore.RED}[-] Response is not similar to valid token response{Style.RESET_ALL}")
+                initial_confidence -= 20  # Penalize for not being similar to valid response
         else:
             print(f"{Fore.YELLOW}[!] No baseline responses available for comparison{Style.RESET_ALL}")
         
@@ -316,7 +327,9 @@ class JWTConfusionScanner:
         # Check for success indicators in response text
         success_indicators_found = []
         for indicator in self.success_indicators:
-            if indicator.lower() in response.text.lower():
+            # More contextual check for success indicators
+            # Look for indicators in specific contexts, not just anywhere in the page
+            if self._check_indicator_in_context(response.text, indicator):
                 success_indicators_found.append(indicator)
                 initial_confidence += 15  # Add confidence for each success indicator
         
@@ -365,6 +378,12 @@ class JWTConfusionScanner:
             
             print(f"{Fore.BLUE}[*] Content length - Current: {current_len}, Valid: {valid_len}, Invalid: {invalid_len}{Style.RESET_ALL}")
             
+            # If valid and invalid lengths are very close to each other, this is suspicious
+            if abs(valid_len - invalid_len) < 0.05 * max(valid_len, invalid_len):  # Less than 5% difference
+                print(f"{Fore.YELLOW}[!] Warning: Valid and invalid baseline content lengths are very similar{Style.RESET_ALL}")
+                print(f"{Fore.YELLOW}[!] This suggests the site may be ignoring JWT tokens{Style.RESET_ALL}")
+                initial_confidence -= 30
+            
             # If response length is closer to valid than invalid
             if valid_len_diff < invalid_len_diff:
                 # If they're significantly different
@@ -376,16 +395,17 @@ class JWTConfusionScanner:
                     print(f"{Fore.YELLOW}[+] Response length is somewhat closer to valid response{Style.RESET_ALL}")
             else:
                 print(f"{Fore.RED}[-] Response length is closer to invalid response{Style.RESET_ALL}")
+                initial_confidence -= 10  # Penalize for being closer to invalid response
         
         # Finalize confidence score (cap between 0-100)
         confidence = max(0, min(100, initial_confidence))
         result["confidence"] = confidence
         
         # Determine success based on confidence threshold
-        if confidence >= 60:  # High confidence threshold
+        if confidence >= 70:  # Increased threshold for high confidence
             result["success"] = True
             result["reason"] = "High confidence of successful exploitation"
-        elif confidence >= 40:  # Medium confidence
+        elif confidence >= 50:  # Increased threshold for medium confidence
             result["success"] = True  
             result["reason"] = "Medium confidence of successful exploitation"
         else:
@@ -393,7 +413,7 @@ class JWTConfusionScanner:
             result["reason"] = "Low confidence of successful exploitation"
             
         # Report confidence level
-        confidence_label = "HIGH" if confidence >= 70 else "MEDIUM" if confidence >= 40 else "LOW"
+        confidence_label = "HIGH" if confidence >= 70 else "MEDIUM" if confidence >= 50 else "LOW"
         print(f"{Fore.BLUE}[*] Final confidence: {confidence}% ({confidence_label}){Style.RESET_ALL}")
         
         # Final assessment
@@ -754,17 +774,59 @@ except requests.exceptions.RequestException as e:
         print(f"\n{Fore.BLUE}[*] Trying {attack_type}: {description}{Style.RESET_ALL}")
         print(f"{Fore.BLUE}[*] Modified token: {token[:20]}...{token[-20:]}{Style.RESET_ALL}")
         
+        # Initialize attack responses tracking if not already done
+        if not hasattr(self, '_attack_responses'):
+            self._attack_responses = {}
+        
         # First test against main endpoint
         response = self._make_request(token)
         if not response:
             print(f"{Fore.RED}[-] No response received{Style.RESET_ALL}")
             return {"success": False, "confidence": 0, "verified": False, "reason": "No response received"}
         
+        # Store this response for future comparisons
+        self._attack_responses[attack_type] = response
+        
         print(f"{Fore.BLUE}[*] Response status code: {response.status_code}{Style.RESET_ALL}")
+        
+        # Check if responses from different attacks are too similar
+        # This would suggest the site is ignoring the tokens
+        if len(self._attack_responses) > 1:
+            similar_attacks = []
+            for prev_attack, prev_response in self._attack_responses.items():
+                if prev_attack != attack_type:
+                    similarity = self._calculate_similarity(response, prev_response)
+                    if similarity > 0.95:  # Very similar responses for different attacks
+                        similar_attacks.append((prev_attack, similarity))
+            
+            if similar_attacks:
+                print(f"{Fore.YELLOW}[!] Warning: Response very similar to previous attacks:{Style.RESET_ALL}")
+                for prev_attack, similarity in similar_attacks:
+                    print(f"{Fore.YELLOW}[!]   - {prev_attack}: {similarity:.2f} similarity{Style.RESET_ALL}")
+                print(f"{Fore.YELLOW}[!] This suggests the site may be ignoring JWT tokens{Style.RESET_ALL}")
+        
+        # Verify if token is used for authentication
+        auth_confidence = self._verify_authentication(token)
         
         # Evaluate initial response
         print(f"{Fore.BLUE}[*] Evaluating response...{Style.RESET_ALL}")
         initial_result = self._evaluate_response(response, attack_type)
+        
+        # Apply authentication factor to confidence
+        auth_factor = 1.0
+        if auth_confidence < 0.1:  # Very low authentication confidence
+            auth_factor = 0.3  # Reduce final confidence to 30%
+            print(f"{Fore.YELLOW}[!] Reducing confidence due to low authentication verification{Style.RESET_ALL}")
+        elif auth_confidence < 0.3:  # Low authentication confidence
+            auth_factor = 0.6  # Reduce final confidence to 60%
+            print(f"{Fore.YELLOW}[!] Slightly reducing confidence due to authentication verification{Style.RESET_ALL}")
+        
+        # Apply the authentication factor
+        adjusted_confidence = int(initial_result["confidence"] * auth_factor)
+        initial_result["confidence"] = adjusted_confidence
+        initial_result["auth_confidence"] = auth_confidence
+        
+        print(f"{Fore.BLUE}[*] Adjusted confidence: {adjusted_confidence}% (auth factor: {auth_factor:.2f}){Style.RESET_ALL}")
         
         # If not successful, return immediately
         if not initial_result["success"]:
@@ -776,7 +838,8 @@ except requests.exceptions.RequestException as e:
                 "attack_type": attack_type,
                 "token": token,
                 "description": description,
-                "reason": initial_result["reason"]
+                "reason": initial_result["reason"],
+                "auth_confidence": auth_confidence
             }
             
         # If we have a verification endpoint and it's different from the main endpoint,
@@ -809,9 +872,9 @@ except requests.exceptions.RequestException as e:
         else:
             # If we don't have a separate verification endpoint, use the initial confidence
             verification_confidence = initial_result["confidence"]
-            if verification_confidence >= 70:  # Only auto-verify if confidence is very high
+            if verification_confidence >= 80 and auth_confidence > 0.5:  # Only auto-verify if both confidence scores are high
                 verified = True
-                print(f"{Fore.GREEN}[+] Auto-verified due to high confidence score.{Style.RESET_ALL}")
+                print(f"{Fore.GREEN}[+] Auto-verified due to high confidence score and authentication verification.{Style.RESET_ALL}")
         
         # Generate POC if vulnerability is verified
         poc_data = None
@@ -832,6 +895,7 @@ except requests.exceptions.RequestException as e:
             "token": token,
             "attack_type": attack_type,
             "description": description,
+            "auth_confidence": auth_confidence,
             "initial_response": {
                 "status_code": response.status_code,
                 "content_length": len(response.content)
@@ -1297,6 +1361,188 @@ except requests.exceptions.RequestException as e:
             import traceback
             traceback.print_exc()
             return {'success': False, 'message': str(e)}
+
+    def _check_indicator_in_context(self, html_content: str, indicator: str) -> bool:
+        """
+        Check if a success indicator appears in a meaningful context,
+        not just anywhere in the page content.
+        
+        Args:
+            html_content: HTML content to check
+            indicator: Success indicator to look for
+            
+        Returns:
+            bool: True if indicator is found in a meaningful context
+        """
+        # Simple case - indicator not in content at all
+        if indicator.lower() not in html_content.lower():
+            return False
+            
+        # For more specific indicators, context matters less
+        specific_indicators = ['administrator', 'superuser', 'root access', 'full access']
+        if indicator.lower() in specific_indicators:
+            return indicator.lower() in html_content.lower()
+            
+        try:
+            # Look for indicator in specific contexts that suggest successful authentication
+            contexts = [
+                # Look for indicator near authentication-related elements
+                r'<div[^>]*(?:auth|login|user|account|profile)[^>]*>(?:[^<]|<(?!div))*' + re.escape(indicator) + r'(?:[^<]|<(?!div))*</div>',
+                
+                # Look for indicator in JSON data
+                r'"(?:status|role|permission|auth|user)["\s:]+["\[{]*' + re.escape(indicator) + r'["\]}]*',
+                
+                # Look for indicator in form feedback
+                r'<(?:div|span|p)[^>]*(?:message|alert|notification|feedback)[^>]*>(?:[^<]|<(?!div|span|p))*' + re.escape(indicator) + r'(?:[^<]|<(?!div|span|p))*</(?:div|span|p)>',
+            ]
+            
+            for pattern in contexts:
+                if re.search(pattern, html_content, re.IGNORECASE):
+                    return True
+                    
+            # For common words like "success" or "profile" that appear in many places,
+            # be more strict to avoid false positives
+            common_indicators = ['success', 'valid', 'profile', 'account', 'logged in']
+            if indicator.lower() in common_indicators:
+                # Only count if it appears in a likely authentication context
+                auth_contexts = [
+                    r'<div[^>]*(?:auth-|login-|user-|account-)[^>]*>',
+                    r'class=["\'](?:[^"\']*\s)?(?:auth|login|user|account|profile)[^"\']*["\']',
+                    r'id=["\'](?:auth|login|user|account|profile)["\']',
+                ]
+                
+                # Check if indicator is within a reasonable distance of an auth context
+                for auth_pattern in auth_contexts:
+                    auth_matches = list(re.finditer(auth_pattern, html_content, re.IGNORECASE))
+                    indicator_matches = list(re.finditer(re.escape(indicator), html_content, re.IGNORECASE))
+                    
+                    for auth_match in auth_matches:
+                        auth_pos = auth_match.start()
+                        for ind_match in indicator_matches:
+                            ind_pos = ind_match.start()
+                            # If indicator is within 500 characters of auth context
+                            if abs(ind_pos - auth_pos) < 500:
+                                return True
+                
+                # If we got here, the common indicator was not found in an auth context
+                return False
+                
+            # For other indicators, default to simple presence check
+            return True
+                
+        except Exception as e:
+            # If regex fails, fall back to simple check
+            self._print_verbose(f"Error in contextual indicator check: {str(e)}")
+            return indicator.lower() in html_content.lower()
+
+    def _verify_authentication(self, token: str) -> float:
+        """
+        Verify if the token is actually being used for authentication
+        by comparing access to potentially protected resources
+        
+        Args:
+            token: JWT token to test
+            
+        Returns:
+            float: Authentication confidence score (0.0 to 1.0)
+        """
+        print(f"{Fore.BLUE}[*] Verifying if token affects authentication...{Style.RESET_ALL}")
+        auth_confidence = 0.0
+        
+        # Try accessing common protected endpoints
+        protected_paths = ['/admin', '/dashboard', '/profile', '/settings', '/account', '/api/user']
+        base_url = '/'.join(self.target_url.split('/')[:3])  # Get domain portion
+        
+        # First try without any token
+        no_token_responses = {}
+        for path in protected_paths:
+            try:
+                url = f"{base_url}{path}"
+                print(f"{Fore.BLUE}[*] Testing without token: {url}{Style.RESET_ALL}")
+                response = self.session.get(url, verify=False, timeout=5)
+                no_token_responses[path] = {
+                    'status': response.status_code,
+                    'length': len(response.content),
+                    'headers': dict(response.headers)
+                }
+                time.sleep(self.delay)  # Respect delay setting
+            except Exception as e:
+                print(f"{Fore.YELLOW}[!] Error accessing {url}: {str(e)}{Style.RESET_ALL}")
+                continue
+        
+        # Then try with the token
+        token_responses = {}
+        if self.auth_header:
+            headers = {'Authorization': f"Bearer {token}"}
+            cookies = {}
+        elif self.cookie_name:
+            headers = {}
+            cookies = {self.cookie_name: token}
+        else:
+            # If no method specified, try both
+            headers = {'Authorization': f"Bearer {token}"}
+            cookies = {'jwt': token, 'token': token, 'access_token': token}
+            
+        for path in protected_paths:
+            try:
+                url = f"{base_url}{path}"
+                print(f"{Fore.BLUE}[*] Testing with token: {url}{Style.RESET_ALL}")
+                response = self.session.get(url, headers=headers, cookies=cookies, verify=False, timeout=5)
+                token_responses[path] = {
+                    'status': response.status_code,
+                    'length': len(response.content),
+                    'headers': dict(response.headers)
+                }
+                time.sleep(self.delay)  # Respect delay setting
+            except Exception as e:
+                print(f"{Fore.YELLOW}[!] Error accessing {url} with token: {str(e)}{Style.RESET_ALL}")
+                continue
+        
+        # Compare responses
+        differences_found = 0
+        paths_checked = 0
+        
+        for path in protected_paths:
+            if path in no_token_responses and path in token_responses:
+                paths_checked += 1
+                no_token_resp = no_token_responses[path]
+                token_resp = token_responses[path]
+                
+                # Check for significant differences
+                status_diff = abs(no_token_resp['status'] - token_resp['status'])
+                length_diff = abs(no_token_resp['length'] - token_resp['length'])
+                length_diff_percent = length_diff / max(1, no_token_resp['length']) * 100
+                
+                print(f"{Fore.BLUE}[*] Path {path} - Status diff: {status_diff}, Length diff: {length_diff} ({length_diff_percent:.2f}%){Style.RESET_ALL}")
+                
+                # Status code difference (e.g., 401/403 vs 200)
+                if status_diff >= 100:
+                    differences_found += 1
+                    print(f"{Fore.GREEN}[+] Significant status code difference for {path}{Style.RESET_ALL}")
+                # Large content length difference (>10%)
+                elif length_diff_percent > 10:
+                    differences_found += 0.5
+                    print(f"{Fore.GREEN}[+] Significant content length difference for {path}{Style.RESET_ALL}")
+                # Different redirect location
+                elif ('Location' in no_token_resp['headers']) != ('Location' in token_resp['headers']):
+                    differences_found += 0.5
+                    print(f"{Fore.GREEN}[+] Different redirect behavior for {path}{Style.RESET_ALL}")
+                else:
+                    print(f"{Fore.RED}[-] No significant difference for {path}{Style.RESET_ALL}")
+        
+        if paths_checked > 0:
+            auth_confidence = differences_found / paths_checked
+            print(f"{Fore.BLUE}[*] Authentication verification confidence: {auth_confidence:.2f}{Style.RESET_ALL}")
+            
+            if auth_confidence < 0.1:
+                print(f"{Fore.YELLOW}[!] Warning: Token does not appear to affect access to resources{Style.RESET_ALL}")
+                print(f"{Fore.YELLOW}[!] This suggests the site may be ignoring JWT tokens{Style.RESET_ALL}")
+            elif auth_confidence > 0.5:
+                print(f"{Fore.GREEN}[+] Token appears to affect access to resources{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.YELLOW}[!] Could not check any protected paths{Style.RESET_ALL}")
+        
+        return auth_confidence
 
 
 def main():
