@@ -18,8 +18,8 @@ This tool systematically tests targets for multiple JWT attack vectors:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/jwt-confusion-scanner.git
-cd jwt-confusion-scanner
+git clone https://github.com/geeknik/jwt-scanner.git
+cd jwt-scanner
 
 # Install dependencies
 pip install -r requirements.txt
